@@ -89,6 +89,14 @@ def check_pdftotext_installed():
         print("On Debian/Ubuntu: sudo apt-get install poppler-utils", file=sys.stderr)
         sys.exit(1)
 
+def check_ocrmypdf_installed():
+    """Checks if ocrmypdf is in the system's PATH."""
+    if not shutil.which("ocrmypdf"):
+        print("Error: 'ocrmypdf' command not found.", file=sys.stderr)
+        print("Please install ocrmypdf to use the OCR feature.", file=sys.stderr)
+        print("See: https://ocrmypdf.readthedocs.io/en/latest/installation.html", file=sys.stderr)
+        sys.exit(1)
+
 def convert_pdfs_to_text(pdf_dir, text_dir):
     """Converts all PDFs in a directory to text files."""
     pdf_files = [f for f in os.listdir(pdf_dir) if f.lower().endswith('.pdf')]
@@ -106,6 +114,80 @@ def convert_pdfs_to_text(pdf_dir, text_dir):
         except subprocess.CalledProcessError as e:
             print(f"Failed to convert {filename}: {e.stderr}", file=sys.stderr)
     print("Conversion complete.")
+
+def handle_broken_extraction(text_dir, pdf_dir):
+    """Checks for broken characters in text files and offers to fix with OCR."""
+    broken_files = []
+    # Unicode replacement character ''
+    REPLACEMENT_CHAR = "\uFFFD"
+    for filename in os.listdir(text_dir):
+        if not filename.endswith('.txt'):
+            continue
+        file_path = os.path.join(text_dir, filename)
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                if REPLACEMENT_CHAR in f.read():
+                    broken_files.append(filename)
+        except UnicodeDecodeError:
+            # File might not be utf-8, which can also be a sign of a problem
+            broken_files.append(filename)
+            continue
+    
+    if not broken_files:
+        return
+
+    # Sort the files naturally to handle filenames with numbers correctly (e.g., 1.txt, 2.txt, 10.txt)
+    def natural_sort_key(s):
+        return [int(c) if c.isdigit() else c.lower() for c in re.split('([0-9]+)', s)]
+    broken_files.sort(key=natural_sort_key)
+
+    print("\n" + "="*80)
+    print("--- WARNING: Possible text extraction issues detected ---")
+    print(f"The following files contain broken characters ('{REPLACEMENT_CHAR}') and may be scanned images:")
+    for f in broken_files:
+        print(f"  - {os.path.splitext(f)[0] + '.pdf'}")
+    
+    while True:
+        choice = input("\nDo you want to try fixing these with OCR? This might take a while. [y/n]: ").lower().strip()
+        if choice in ['y', 'yes']:
+            check_ocrmypdf_installed()
+            
+            fixed_dir_path = os.path.join(pdf_dir, "fixed_pdfs")
+            os.makedirs(fixed_dir_path, exist_ok=True)
+            print(f"\nCreated directory for OCR'd PDFs: {fixed_dir_path}")
+
+            print("Running OCR... This can be slow, please wait.")
+            for i, txt_filename in enumerate(broken_files):
+                pdf_filename = os.path.splitext(txt_filename)[0] + '.pdf'
+                pdf_path = os.path.join(pdf_dir, pdf_filename)
+                ocr_pdf_path = os.path.join(fixed_dir_path, pdf_filename)
+                txt_path = os.path.join(text_dir, txt_filename)
+                
+                if not os.path.exists(pdf_path):
+                    print(f"  [Skipping] Original PDF not found: {pdf_path}", file=sys.stderr)
+                    continue
+
+                print(f"  [{i+1}/{len(broken_files)}] Processing '{pdf_filename}'...")
+                try:
+                    # Using --force-ocr to ensure processing even if text is found
+                    # Using --sidecar to output the text directly, overwriting the bad file
+                    subprocess.run(
+                        ['ocrmypdf', '--force-ocr', pdf_path, ocr_pdf_path, '--sidecar', txt_path],
+                        check=True, capture_output=True, text=True, encoding='utf-8'
+                    )
+                except subprocess.CalledProcessError as e:
+                    print(f"    ERROR on {pdf_filename}: {e.stderr}", file=sys.stderr)
+                except FileNotFoundError:
+                    # This case is handled by check_ocrmypdf_installed, but as a fallback.
+                    print("FATAL: ocrmypdf command not found. Please install it.", file=sys.stderr)
+                    sys.exit(1)
+
+            print("\nOCR processing complete.")
+            print("The script will now continue with the corrected text files.")
+            break
+        elif choice in ['n', 'no']:
+            print("Skipping OCR. Analysis will proceed with potentially broken text.")
+            break
 
 def analyze_invoice_text(content):
     """Extracts amounts and determines if discounts can be auto-applied or need interaction."""
@@ -249,6 +331,7 @@ def main():
 
     with tempfile.TemporaryDirectory() as temp_dir:
         convert_pdfs_to_text(invoice_dir, temp_dir)
+        handle_broken_extraction(temp_dir, invoice_dir)
 
         # Step 1: Detect and handle duplicates
         if detect_and_handle_duplicates(temp_dir, invoice_dir):
